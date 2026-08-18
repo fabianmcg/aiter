@@ -145,3 +145,58 @@ pip install -r requirements-triton-comms.txt
 ```
 
 For more details, see [docs/triton_comms.md](docs/triton_comms.md).
+
+### Fused GEMM + RMSNorm + GEMM (gfx950 only)
+
+The fused-epilogue GEMM chain (`gemm_rmsnorm_gemm_*`) requires a custom build of hipblaslt that exposes the epilogue API. This is a **gfx950-only** feature (MI350 / MI355X); it is a no-op on gfx942 (MI300X / MI325X).
+
+**Requirement:** set `AITER_HIPBLASLT_PATH` to the absolute path of your custom `libhipblaslt.so` before building and before running. The same variable drives both the JIT compile flags (`-I`, `-L`, `-DCUSTOM_HIPBLASLT_PATH`) and the runtime `dlopen`. Without it, the module still imports but the first call raises a build error.
+
+```bash
+# Point at the .so file — e.g. from a local rocm-libraries build:
+export AITER_HIPBLASLT_PATH=/path/to/hipblaslt-install/lib/libhipblaslt.so.1
+
+# Then build (or rebuild if you already built without the variable):
+AITER_REBUILD=1 python3 setup.py develop
+```
+
+The directory layout expected from `AITER_HIPBLASLT_PATH=/prefix/lib/libhipblaslt.so.1`:
+
+| Component | Derived path |
+|---|---|
+| Include headers | `$AITER_HIPBLASLT_PATH/../../include` (i.e. `/prefix/include`) |
+| Link library | `-L/prefix/lib -lhipblaslt` |
+| Runtime rpath | `/prefix/lib` |
+
+If you do not have a custom hipblaslt build, leave `AITER_HIPBLASLT_PATH` unset — the module is imported but gated by a `NotImplementedError` at the Python entry points.
+
+## Build Configuration Reference
+
+All environment variables that influence the build or runtime behavior:
+
+### Build-time variables (set before `python3 setup.py develop`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `BUILD_TARGET` | `auto` | GPU target override (e.g. `gfx942`, `gfx950`). `auto` detects the installed GPU. |
+| `PREBUILD_KERNELS` | `0` | Set to `1` to AOT-compile all kernels during install instead of lazily at first use. |
+| `PRETUNE_MODULES` | `` | Comma-separated list of module names to pre-tune during install. |
+| `ENABLE_CK` | `1` | Set to `0` to skip Composable Kernel (CK) compilation. Speeds up the build on machines where CK is not needed. |
+| `AITER_TRITON_ONLY` | `0` | Set to `1` to build only the Triton/Python layer — skips all C++/HIP compilation. Useful on Windows or machines without a ROCm toolchain. |
+| `AITER_USE_SYSTEM_TRITON` | `0` | Set to `1` to keep the already-installed triton rather than installing the AMD-pinned version. |
+| `MAX_JOBS` | auto | Number of parallel compile jobs. Defaults to a heuristic based on CPU cores and free RAM. |
+| `CK_DIR` | `3rdparty/composable_kernel` | Path to an external CK checkout to use instead of the bundled submodule. |
+| `AITER_HIPBLASLT_PATH` | _(unset)_ | Absolute path to `libhipblaslt.so` for the fused GEMM + RMSNorm + GEMM epilogue feature (gfx950 only). See section above. |
+
+### Runtime variables (set before running your workload)
+
+| Variable | Default | Description |
+|---|---|---|
+| `AITER_REBUILD` | `0` | Set to `1` to force a clean JIT recompile of all modules on the next import, discarding any cached `.so`. |
+| `AITER_HIPBLASLT_PATH` | _(unset)_ | Same as above — must also be set at runtime so the custom library can be `dlopen`-ed. |
+| `AITER_LOG_MORE` | `0` | Set to `1` for verbose JIT build and dispatch logging. |
+| `AITER_LOG_TUNED_CONFIG` | `0` | Set to `1` to log which tuned GEMM config is selected at each call site. |
+| `AITER_DISABLE_KERNARG_PRELOAD` | `0` | Set to `1` to disable kernel-argument preloading (debugging aid). |
+| `AITER_ENABLE_EXPERIMENTAL` | `0` | Set to `1` to enable experimental operators not yet in the stable API. |
+| `AITER_CONFIG_GEMM_A8W8` | _(built-in CSV)_ | Path to a custom tuned-GEMM config CSV for A8W8 (overrides the bundled config). |
+| `AITER_CONFIG_FMOE` | _(built-in CSV)_ | Path to a custom tuned fused-MoE config CSV. |

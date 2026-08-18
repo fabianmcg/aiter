@@ -137,6 +137,10 @@ else:
     from .ops.causal_conv1d_update import *
     from .ops.fused_split_gdr_update import *
     from .ops.gdr_decode_packed_bf16 import *
+    # gemm_rmsnorm_gemm is gfx950-only (custom hipblaslt fused epilogue). Its
+    # public entry points self-guard and raise NotImplementedError on non-gfx950,
+    # so this import stays unconditional and the symbols remain bound everywhere.
+    from .ops.gemm_rmsnorm_gemm import *  # noqa: F403
     from . import mla  # noqa: F401
 
     # isort: on

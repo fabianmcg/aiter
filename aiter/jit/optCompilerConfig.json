@@ -1871,5 +1871,14 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_gemm_rmsnorm_gemm": {
+        "srcs": ["f'{AITER_CSRC_DIR}/pybind/gemm_rmsnorm_gemm_pybind.cu'"],
+        "flags_extra_cc": [],
+        "flags_extra_hip": ["(f'-DCUSTOM_HIPBLASLT_PATH=\\\\\"{os.environ[\"AITER_HIPBLASLT_PATH\"]}\\\\\"' if os.environ.get(\"AITER_HIPBLASLT_PATH\") else '')"],
+        "extra_include": ["(f'{os.path.dirname(os.path.dirname(os.environ[\"AITER_HIPBLASLT_PATH\"]))}/include' if os.environ.get(\"AITER_HIPBLASLT_PATH\") else '')"],
+        "extra_ldflags": "([f'-L{os.path.dirname(os.environ[\"AITER_HIPBLASLT_PATH\"])}', '-lhipblaslt', f'-Wl,-rpath,{os.path.dirname(os.environ[\"AITER_HIPBLASLT_PATH\"])}'] if os.environ.get(\"AITER_HIPBLASLT_PATH\") else None)",
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }
