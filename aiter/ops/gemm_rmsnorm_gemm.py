@@ -122,20 +122,29 @@ def quantize_mxfp8_weight_nhid(W2_bf16: Tensor):
 
 @compile_ops("module_gemm_rmsnorm_gemm", fc_name="gemm_rmsnorm_gemm_bf16", ffi_type="pybind")
 def _gemm_rmsnorm_gemm_bf16(
-    A: Tensor, W1: Tensor, gamma: Tensor, W2: Tensor, eps: float = 1e-5
-) -> Tensor: ...
+    A: Tensor, W1: Tensor, gamma: Tensor, W2: Tensor, eps: float = 1e-5,
+    return_residual: bool = False, residual_in: Tensor | None = None,
+) -> list[Tensor]: ...
 
 
 def gemm_rmsnorm_gemm_bf16(
-    A: Tensor, W1: Tensor, gamma: Tensor, W2: Tensor, eps: float = 1e-5
-) -> Tensor:
+    A: Tensor, W1: Tensor, gamma: Tensor, W2: Tensor, eps: float = 1e-5,
+    return_residual: bool = False, residual_in: Tensor | None = None,
+) -> Tensor | tuple[Tensor, Tensor]:
     """Fused bf16 GEMM1 + RMSNorm + GEMM2.
 
     A: [M, K1], W1: [K1, N_hidden], gamma: [N_hidden], W2: [N_hidden, N_out].
-    Returns [M, N_out] = RMSNorm(A @ W1, gamma, eps) @ W2.
+    residual_in: optional [M, N_hidden] bf16 added to GEMM1 output before RMSNorm.
+    Returns [M, N_out] bf16. When return_residual=True also returns the pre-RMSNorm
+    hidden H = A @ W1 + residual_in as [M, N_hidden] bf16.
     """
     _require_gfx950()
-    return _gemm_rmsnorm_gemm_bf16(A, W1, gamma, W2, eps)
+    if residual_in is not None:
+        return_residual = True
+    outs = _gemm_rmsnorm_gemm_bf16(A, W1, gamma, W2, eps, return_residual, residual_in)
+    if return_residual:
+        return outs[0], outs[1]
+    return outs[0]
 
 
 @compile_ops("module_gemm_rmsnorm_gemm", fc_name="gemm_rmsnorm_gemm_mxfp8_producer", ffi_type="pybind")
@@ -294,13 +303,15 @@ def gemm_rmsnorm_gemm(
     if A.dtype == bf16 and B2.dtype == bf16:
         if scaleA is not None or scaleB1 is not None or scaleB2 is not None:
             raise ValueError("bf16 chain takes no scales; got a non-None scale")
-        if return_residual or residual is not None:
-            raise NotImplementedError(
-                "return_residual is not supported for the bf16+bf16 chain"
-            )
+        if return_residual and residual is None:
+            raise ValueError("residual must be provided when return_residual=True")
         # B1/B2 are [N,K]; the bf16 entry expects math-layout [K,N], so transpose.
-        out = gemm_rmsnorm_gemm_bf16(A, B1.transpose(0, 1), gamma, B2.transpose(0, 1), eps)
-        return GemmRmsNormGemmOutput(out=out, scaleA=None, residual=None)
+        outs = gemm_rmsnorm_gemm_bf16(
+            A, B1.transpose(0, 1), gamma, B2.transpose(0, 1), eps, return_residual, residual
+        )
+        if return_residual:
+            return GemmRmsNormGemmOutput(out=outs[0], scaleA=None, residual=outs[1])
+        return GemmRmsNormGemmOutput(out=outs, scaleA=None, residual=None)
 
     if A.dtype == bf16 and B2.dtype == fp8:
         if scaleB2 is None:

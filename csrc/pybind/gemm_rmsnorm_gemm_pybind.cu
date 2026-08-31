@@ -389,9 +389,19 @@ static void buildProducerEpilogue(const HbltVtable& v,
                                   void* gammaPtr,
                                   float epsF,
                                   hipblasLtFusedEpilogueRMSNormDescriptor_t stats,
+                                  void* residualInPtr,
+                                  void* residualOutPtr,
                                   FusedEpilogueGuard& prod)
 {
     CHECK_HIPBLAS(v.fusedEpilogueCreate(&prod.handle));
+    if (residualInPtr) {
+        CHECK_HIPBLAS(v.fusedEpilogueAdd(prod.handle, HIPBLASLT_FUSEABLE_EPILOGUE_RESIDUAL_ADD));
+        CHECK_HIPBLAS(v.fusedEpilogueSetAttribute(
+            prod.handle, HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_POINTER, &residualInPtr, sizeof(residualInPtr)));
+        if (residualOutPtr)
+            CHECK_HIPBLAS(v.fusedEpilogueSetAttribute(
+                prod.handle, HIPBLASLT_FUSED_EPILOGUE_RESIDUAL_OUTPUT_POINTER, &residualOutPtr, sizeof(residualOutPtr)));
+    }
     CHECK_HIPBLAS(v.fusedEpilogueAdd(prod.handle, HIPBLASLT_FUSEABLE_EPILOGUE_PARTIAL_RMSNORM_STATS));
     CHECK_HIPBLAS(v.fusedEpilogueSetAttribute(
         prod.handle, HIPBLASLT_FUSED_EPILOGUE_RMSNORM_GAMMA, &gammaPtr, sizeof(gammaPtr)));
@@ -442,13 +452,16 @@ static void validateAndPrepareOperands(torch::Tensor A, torch::Tensor W1,
 }
 
 // A:[M,K1] bf16, W1:[K1,Nhidden] bf16, gamma:[Nhidden] bf16, W2:[Nhidden,Nout] bf16.
-// Returns [M,Nout] bf16 = RMSNorm(A@W1, gamma, eps) @ W2 via the decomposed
-// PARTIAL_RMSNORM_STATS (producer) + RMSNORM_SCALE_APPLY (consumer) flow.
-torch::Tensor gemm_rmsnorm_gemm_bf16(torch::Tensor A,
-                                     torch::Tensor W1,
-                                     torch::Tensor gamma,
-                                     torch::Tensor W2,
-                                     double        eps)
+// Returns [M,Nout] bf16 = RMSNorm(A@W1+residualIn, gamma, eps) @ W2.
+// When returnResidual is true, residualIn must be provided ([M,Nhidden] bf16) and the
+// call additionally returns the pre-RMSNorm hidden H = A@W1 + residualIn as bf16.
+std::vector<torch::Tensor> gemm_rmsnorm_gemm_bf16(torch::Tensor A,
+                                                   torch::Tensor W1,
+                                                   torch::Tensor gamma,
+                                                   torch::Tensor W2,
+                                                   double        eps,
+                                                   bool          returnResidual,
+                                                   std::optional<torch::Tensor> residualIn)
 {
     int64_t M, K1, Nhidden, Nout;
     torch::Tensor aC, b1, b2, gammaC;
@@ -464,6 +477,20 @@ torch::Tensor gemm_rmsnorm_gemm_bf16(torch::Tensor A,
     // GEMM2 D is col-major [M, Nout]; allocate as [Nout, M] and return the transpose.
     torch::Tensor base = torch::empty({Nout, M}, optsBf16);
 
+    torch::Tensor residualInC, residualOut;
+    void* residualInPtr  = nullptr;
+    void* residualOutPtr = nullptr;
+    if (returnResidual) {
+        TORCH_CHECK(residualIn.has_value(), "residual_in must be provided when return_residual=true");
+        const torch::Tensor& r = residualIn.value();
+        TORCH_CHECK(r.is_cuda() && r.scalar_type() == at::kBFloat16, "residual_in must be a bf16 cuda tensor");
+        TORCH_CHECK(r.dim() == 2 && r.size(0) == M && r.size(1) == Nhidden, "residual_in shape must be [M, Nhidden]");
+        residualInC  = r.contiguous();
+        residualOut  = torch::empty({M, Nhidden}, optsBf16);
+        residualInPtr  = residualInC.data_ptr();
+        residualOutPtr = residualOut.data_ptr();
+    }
+
     auto [wsPtr, wsSize] = getWorkspace(A.device());
 
     const HbltVtable& v      = HbltVtable::get();
@@ -473,7 +500,8 @@ torch::Tensor gemm_rmsnorm_gemm_bf16(torch::Tensor A,
     CHECK_HIPBLAS(v.rmsNormDescCreate(&gStats.handle));
 
     FusedEpilogueGuard gProd;
-    buildProducerEpilogue(v, gammaC.data_ptr(), static_cast<float>(eps), gStats.handle, gProd);
+    buildProducerEpilogue(v, gammaC.data_ptr(), static_cast<float>(eps), gStats.handle,
+                          residualInPtr, residualOutPtr, gProd);
     runTnFusedBf16(handle, M, Nhidden, K1, aC.data_ptr(), K1, b1.data_ptr(),
                    h2.data_ptr(), h2.data_ptr(), gProd.handle, wsPtr, wsSize, stream);
 
@@ -482,7 +510,10 @@ torch::Tensor gemm_rmsnorm_gemm_bf16(torch::Tensor A,
     runTnFusedBf16(handle, M, Nout, Nhidden, h2.data_ptr(), Nhidden, b2.data_ptr(),
                    base.data_ptr(), base.data_ptr(), gCons.handle, wsPtr, wsSize, stream);
 
-    return base.transpose(0, 1); // [M, Nout] view.
+    torch::Tensor out = base.transpose(0, 1); // [M, Nout] view.
+    if (returnResidual)
+        return {out, residualOut};
+    return {out};
 }
 
 // Builds PARTIAL_RMSNORM_STATS + REQUANT(MX-fp8) producer fused epilogue.
@@ -878,7 +909,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("W1"),
           py::arg("gamma"),
           py::arg("W2"),
-          py::arg("eps") = 1e-5);
+          py::arg("eps") = 1e-5,
+          py::arg("return_residual") = false,
+          py::arg("residual_in") = py::none());
     m.def("gemm_rmsnorm_gemm_mxfp8_producer",
           &gemm_rmsnorm_gemm_mxfp8_producer,
           "Fused bf16 GEMM1 + partial RMSNorm stats + dynamic MXFP8 requant (producer)",

@@ -57,6 +57,14 @@ def _run_case(M, K1, Nhidden, Nout):
     tol = torch.maximum(torch.full_like(ref, 5e-2), 5e-2 * ref.abs())
     mism = (abs_err > tol).sum().item()
     assert mism == 0, f"mismatches={mism} max_abs={abs_err.max().item()}"
+
+    # Residual path: H = A @ W1 + res_in stored as bf16 (exact match expected).
+    res_in = (torch.randn(M, Nhidden, device="cuda") * 0.1).to(torch.bfloat16)
+    out2, residual_out = aiter.gemm_rmsnorm_gemm_bf16(A, W1, gamma, W2, eps,
+                                                       return_residual=True, residual_in=res_in)
+    H_ref = (A.float() @ W1.float() + res_in.float()).to(torch.bfloat16)
+    res_diff = (residual_out.float() - H_ref.float()).abs().max().item()
+    assert res_diff < 1e-2, f"bf16 residual_out mismatch max_abs={res_diff}"
     return "pass"
 
 
@@ -397,6 +405,15 @@ if pytest is not None:
         mism = (abs_err > tol).sum().item()
         assert mism == 0, f"mismatches={mism} max_abs={abs_err.max().item()}"
 
+        # Residual path via unified dispatcher.
+        res_in = (torch.randn(M, Nhidden, device="cuda") * 0.1).to(torch.bfloat16)
+        res2 = aiter.gemm_rmsnorm_gemm(A, B1_nk, gamma, B2_nk, eps=eps,
+                                        return_residual=True, residual=res_in)
+        assert res2.residual is not None and res2.residual.shape == (M, Nhidden)
+        H_ref = (A.float() @ B1_nk.T.float() + res_in.float()).to(torch.bfloat16)
+        res_diff = (res2.residual.float() - H_ref.float()).abs().max().item()
+        assert res_diff == 0.0, f"bf16 unified residual_out mismatch max_abs={res_diff}"
+
     @pytest.mark.parametrize("mTok,K1,nHid,nOut", MXFP8_CASES)
     def test_unified_mxfp8(mTok, K1, nHid, nOut):
         torch.manual_seed(1)
@@ -458,8 +475,8 @@ if pytest is not None:
         # bf16 chain rejects any non-None scale.
         with _pytest.raises(ValueError, match="no scales"):
             aiter.gemm_rmsnorm_gemm(A_bf, B1_bf, g, B2_bf, scaleB2=sc)
-        # bf16 chain rejects return_residual.
-        with _pytest.raises(NotImplementedError):
+        # bf16 chain requires residual_in when return_residual=True.
+        with _pytest.raises(ValueError, match="residual must be provided"):
             aiter.gemm_rmsnorm_gemm(A_bf, B1_bf, g, B2_bf, return_residual=True)
         # mxfp8 chain requires scaleB2.
         with _pytest.raises(ValueError, match="scaleB2"):
@@ -564,6 +581,13 @@ if __name__ == "__main__":
             tol = torch.maximum(torch.full_like(ref, 5e-2), 5e-2 * ref.abs())
             mism = (abs_err > tol).sum().item()
             assert mism == 0, f"mismatches={mism}"
+            # Residual path.
+            res_in = (torch.randn(M, Nhidden, device="cuda") * 0.1).to(torch.bfloat16)
+            res2 = aiter.gemm_rmsnorm_gemm(A, B1_nk, gamma, B2_nk, eps=eps,
+                                            return_residual=True, residual=res_in)
+            H_ref = (A.float() @ B1_nk.T.float() + res_in.float()).to(torch.bfloat16)
+            res_diff = (res2.residual.float() - H_ref.float()).abs().max().item()
+            assert res_diff < 1e-2, f"bf16 residual_out mismatch max_abs={res_diff}"
         except (RuntimeError, AssertionError) as exc:
             print(f"  UNIFIED BF16 FAIL ({M},{K1},{Nhidden},{Nout}): {exc}")
             unified_bf16_passed = False
