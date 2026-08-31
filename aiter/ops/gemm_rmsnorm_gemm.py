@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+from collections import namedtuple
+
 import numpy as np
 import torch
 from torch import Tensor
@@ -13,6 +15,8 @@ __all__ = [
     "gemm_rmsnorm_gemm_mxfp8_fp8in",
     "quantize_mxfp8_gfx950",
     "quantize_mxfp8_weight_nhid",
+    "gemm_rmsnorm_gemm",
+    "GemmRmsNormGemmOutput",
 ]
 
 
@@ -244,3 +248,74 @@ def gemm_rmsnorm_gemm_mxfp8_fp8in(
         return out, scaleA2, residual_out
     out, scaleA2 = outs
     return out, scaleA2
+
+
+GemmRmsNormGemmOutput = namedtuple(
+    "GemmRmsNormGemmOutput", ["out", "scaleA", "residual"]
+)
+
+
+def gemm_rmsnorm_gemm(
+    A: Tensor,
+    B1: Tensor,
+    gamma: Tensor,
+    B2: Tensor,
+    *,
+    scaleA: Tensor | None = None,
+    scaleB1: Tensor | None = None,
+    scaleB2: Tensor | None = None,
+    eps: float = 1e-5,
+    return_residual: bool = False,
+    residual: Tensor | None = None,
+) -> GemmRmsNormGemmOutput:
+    """Unified GEMM->RMSNorm->GEMM dispatcher.
+
+    Operand contract:
+      A:      [mTok, K1]     bf16 or float8_e4m3fn
+      B1:     [nHid, K1]     bf16 or float8_e4m3fn
+      gamma:  [nHid]         bf16
+      B2:     [nOut, nHid]   bf16 or float8_e4m3fn
+      scaleA/scaleB1/scaleB2: uint8 GFX950 UE8M0 block-32 scales for fp8 operands; None for bf16 operands.
+
+    Dispatch:
+      bf16+bf16:  A=bf16, B2=bf16 -> bf16 GEMM1 -> bf16 GEMM2 (no scales)
+      mxfp8:      A=bf16, B2=fp8  -> bf16 GEMM1 (requant->fp8) -> fp8 GEMM2 (requires scaleB2)
+      fp8-in:     A=fp8,  B1=fp8, B2=fp8 -> fp8 GEMM1 -> fp8 GEMM2 (requires scaleA, scaleB1, scaleB2)
+    """
+    _require_gfx950()
+    bf16 = torch.bfloat16
+    fp8 = torch.float8_e4m3fn
+
+    def _pack(outs, want_residual):
+        if want_residual:
+            return GemmRmsNormGemmOutput(out=outs[0], scaleA=outs[1], residual=outs[2])
+        return GemmRmsNormGemmOutput(out=outs[0], scaleA=outs[1], residual=None)
+
+    if A.dtype == bf16 and B2.dtype == bf16:
+        if scaleA is not None or scaleB1 is not None or scaleB2 is not None:
+            raise ValueError("bf16 chain takes no scales; got a non-None scale")
+        if return_residual or residual is not None:
+            raise NotImplementedError(
+                "return_residual is not supported for the bf16+bf16 chain"
+            )
+        # B1/B2 are [N,K]; the bf16 entry expects math-layout [K,N], so transpose.
+        out = gemm_rmsnorm_gemm_bf16(A, B1.transpose(0, 1), gamma, B2.transpose(0, 1), eps)
+        return GemmRmsNormGemmOutput(out=out, scaleA=None, residual=None)
+
+    if A.dtype == bf16 and B2.dtype == fp8:
+        if scaleB2 is None:
+            raise ValueError("mxfp8 chain requires scaleB2")
+        if scaleA is not None or scaleB1 is not None:
+            raise ValueError("mxfp8 chain: A/B1 are bf16 and take no input scales")
+        outs = gemm_rmsnorm_gemm_mxfp8(A, B1, gamma, B2, scaleB2, eps, return_residual, residual)
+        return _pack(outs, return_residual or residual is not None)
+
+    if A.dtype == fp8 and B1.dtype == fp8 and B2.dtype == fp8:
+        if scaleA is None or scaleB1 is None or scaleB2 is None:
+            raise ValueError("fp8-in chain requires scaleA, scaleB1, scaleB2")
+        outs = gemm_rmsnorm_gemm_mxfp8_fp8in(A, scaleA, B1, scaleB1, gamma, B2, scaleB2, eps, return_residual, residual)
+        return _pack(outs, return_residual or residual is not None)
+
+    raise ValueError(
+        f"unsupported dtype combo: A={A.dtype}, B1={B1.dtype}, B2={B2.dtype}"
+    )

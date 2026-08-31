@@ -356,7 +356,6 @@ def _run_mxfp8_residual_case(mTok, K1, nHid, nOut):
 
 if pytest is not None:
     @pytest.mark.parametrize("M,K1,Nhidden,Nout", CASES)
-    @pytest.mark.xfail(strict=False, reason=_BF16_UNAVAIL_REASON)
     def test_gemm_rmsnorm_gemm_bf16(M, K1, Nhidden, Nout):
         _run_case(M, K1, Nhidden, Nout)
 
@@ -375,6 +374,108 @@ if pytest is not None:
     @pytest.mark.parametrize("mTok,K1,nHid,nOut", MXFP8_CASES)
     def test_gemm_rmsnorm_gemm_mxfp8_fp8in_residual(mTok, K1, nHid, nOut):
         _run_fp8in_residual_case(mTok, K1, nHid, nOut)
+
+    @pytest.mark.parametrize("M,K1,Nhidden,Nout", CASES)
+    def test_unified_bf16(M, K1, Nhidden, Nout):
+        torch.manual_seed(0)
+        eps = 1e-5
+        A     = (torch.randn(M, K1, device="cuda") * 0.1).to(torch.bfloat16)
+        # B1=[nHid,K1], B2=[nOut,nHid] — N,K layout expected by the unified dispatcher.
+        B1_nk = (torch.randn(Nhidden, K1, device="cuda") * 0.1).to(torch.bfloat16)
+        gamma = (torch.rand(Nhidden, device="cuda") + 0.5).to(torch.bfloat16)
+        B2_nk = (torch.randn(Nout, Nhidden, device="cuda") * 0.1).to(torch.bfloat16)
+
+        res = aiter.gemm_rmsnorm_gemm(A, B1_nk, gamma, B2_nk, eps=eps)
+        assert res.scaleA is None, "bf16 chain must return scaleA=None"
+        assert res.residual is None, "bf16 chain must return residual=None"
+        assert res.out.shape == (M, Nout), f"unexpected output shape {res.out.shape}"
+
+        # Reference uses W1=[K1,nHid], W2=[nHid,nOut] (math layout).
+        ref = _ref(A, B1_nk.T, gamma, B2_nk.T, eps)
+        abs_err = (res.out.float() - ref).abs()
+        tol = torch.maximum(torch.full_like(ref, 5e-2), 5e-2 * ref.abs())
+        mism = (abs_err > tol).sum().item()
+        assert mism == 0, f"mismatches={mism} max_abs={abs_err.max().item()}"
+
+    @pytest.mark.parametrize("mTok,K1,nHid,nOut", MXFP8_CASES)
+    def test_unified_mxfp8(mTok, K1, nHid, nOut):
+        torch.manual_seed(1)
+        eps   = 1e-5
+        A     = (torch.randn(mTok, K1)   * 0.1).to(torch.bfloat16).cuda()
+        B1    = (torch.randn(nHid, K1)   * 0.1).to(torch.bfloat16).cuda()
+        gamma = (torch.rand(nHid)  + 0.5).to(torch.bfloat16).cuda()
+        W2    = (torch.randn(nOut, nHid) * 0.1).to(torch.bfloat16).cuda()
+        B2_fp8, scaleB2 = quantize_mxfp8_weight_nhid(W2)
+
+        # Direct call for reference.
+        ref_out, ref_scaleA = aiter.gemm_rmsnorm_gemm_mxfp8(A, B1, gamma, B2_fp8, scaleB2, eps)
+
+        # Unified dispatcher call.
+        res = aiter.gemm_rmsnorm_gemm(A, B1, gamma, B2_fp8, scaleB2=scaleB2, eps=eps)
+        assert res.out.shape == ref_out.shape, f"shape mismatch {res.out.shape} vs {ref_out.shape}"
+        assert res.scaleA is not None, "mxfp8 chain must return a scaleA"
+        assert res.residual is None, "residual not requested; must be None"
+        assert torch.equal(res.out, ref_out), "unified mxfp8 output differs from direct call"
+
+    @pytest.mark.parametrize("mTok,K1,nHid,nOut", MXFP8_CASES)
+    def test_unified_fp8in(mTok, K1, nHid, nOut):
+        torch.manual_seed(2)
+        eps   = 1e-5
+        a     = (torch.randn(mTok, K1)   * 0.1).to(torch.bfloat16).cuda()
+        b1    = (torch.randn(nHid, K1)   * 0.1).to(torch.bfloat16).cuda()
+        gamma = (torch.rand(nHid)  + 0.5).to(torch.bfloat16).cuda()
+        w2    = (torch.randn(nOut, nHid) * 0.1).to(torch.bfloat16).cuda()
+
+        a_fp8,  scaleA  = quantize_mxfp8_gfx950(a)
+        b1_fp8, scaleB1 = quantize_mxfp8_gfx950(b1)
+        b2_fp8, scaleB2 = quantize_mxfp8_weight_nhid(w2)
+
+        # Direct call for reference.
+        ref_out, ref_scaleA = aiter.gemm_rmsnorm_gemm_mxfp8_fp8in(
+            a_fp8, scaleA, b1_fp8, scaleB1, gamma, b2_fp8, scaleB2, eps)
+
+        # Unified dispatcher call.
+        res = aiter.gemm_rmsnorm_gemm(
+            a_fp8, b1_fp8, gamma, b2_fp8,
+            scaleA=scaleA, scaleB1=scaleB1, scaleB2=scaleB2, eps=eps)
+        assert res.out.shape == ref_out.shape, f"shape mismatch {res.out.shape} vs {ref_out.shape}"
+        assert res.scaleA is not None, "fp8-in chain must return a scaleA"
+        assert res.residual is None, "residual not requested; must be None"
+        assert torch.equal(res.out, ref_out), "unified fp8-in output differs from direct call"
+
+    def test_unified_dispatch_errors():
+        bf16 = torch.bfloat16
+        fp8  = torch.float8_e4m3fn
+        dev  = "cuda"
+        A_bf = torch.zeros(4, 8, dtype=bf16, device=dev)
+        B1_bf = torch.zeros(16, 8, dtype=bf16, device=dev)
+        g    = torch.ones(16, dtype=bf16, device=dev)
+        B2_bf = torch.zeros(4, 16, dtype=bf16, device=dev)
+        B2_fp = torch.zeros(4, 16, dtype=fp8, device=dev)
+        sc   = torch.zeros(4, dtype=torch.uint8, device=dev)
+
+        import pytest as _pytest
+        # bf16 chain rejects any non-None scale.
+        with _pytest.raises(ValueError, match="no scales"):
+            aiter.gemm_rmsnorm_gemm(A_bf, B1_bf, g, B2_bf, scaleB2=sc)
+        # bf16 chain rejects return_residual.
+        with _pytest.raises(NotImplementedError):
+            aiter.gemm_rmsnorm_gemm(A_bf, B1_bf, g, B2_bf, return_residual=True)
+        # mxfp8 chain requires scaleB2.
+        with _pytest.raises(ValueError, match="scaleB2"):
+            aiter.gemm_rmsnorm_gemm(A_bf, B1_bf, g, B2_fp)
+        # mxfp8 chain rejects input scales for bf16 A/B1.
+        with _pytest.raises(ValueError, match="no input scales"):
+            aiter.gemm_rmsnorm_gemm(A_bf, B1_bf, g, B2_fp, scaleA=sc, scaleB2=sc)
+        # fp8-in chain requires all three scales.
+        A_fp = torch.zeros(4, 8, dtype=fp8, device=dev)
+        B1_fp = torch.zeros(16, 8, dtype=fp8, device=dev)
+        with _pytest.raises(ValueError, match="requires scaleA"):
+            aiter.gemm_rmsnorm_gemm(A_fp, B1_fp, g, B2_fp)
+        # Unsupported dtype combo.
+        B2_f32 = torch.zeros(4, 16, dtype=torch.float32, device=dev)
+        with _pytest.raises(ValueError, match="unsupported dtype"):
+            aiter.gemm_rmsnorm_gemm(A_bf, B1_bf, g, B2_f32)
 
 if __name__ == "__main__":
     bf16_results = []
@@ -445,3 +546,77 @@ if __name__ == "__main__":
 
     if any_bf16_failed:
         print("bf16 Chain A: FAIL")
+
+    # Unified dispatcher — bf16 chain.
+    unified_bf16_passed = True
+    for M, K1, Nhidden, Nout in CASES:
+        torch.manual_seed(0)
+        eps = 1e-5
+        A     = (torch.randn(M, K1, device="cuda") * 0.1).to(torch.bfloat16)
+        B1_nk = (torch.randn(Nhidden, K1, device="cuda") * 0.1).to(torch.bfloat16)
+        gamma = (torch.rand(Nhidden, device="cuda") + 0.5).to(torch.bfloat16)
+        B2_nk = (torch.randn(Nout, Nhidden, device="cuda") * 0.1).to(torch.bfloat16)
+        try:
+            res = aiter.gemm_rmsnorm_gemm(A, B1_nk, gamma, B2_nk, eps=eps)
+            assert res.scaleA is None and res.residual is None
+            ref = _ref(A, B1_nk.T, gamma, B2_nk.T, eps)
+            abs_err = (res.out.float() - ref).abs()
+            tol = torch.maximum(torch.full_like(ref, 5e-2), 5e-2 * ref.abs())
+            mism = (abs_err > tol).sum().item()
+            assert mism == 0, f"mismatches={mism}"
+        except (RuntimeError, AssertionError) as exc:
+            print(f"  UNIFIED BF16 FAIL ({M},{K1},{Nhidden},{Nout}): {exc}")
+            unified_bf16_passed = False
+    if unified_bf16_passed:
+        print("UNIFIED BF16 PASS")
+    else:
+        print("UNIFIED BF16 FAIL")
+
+    # Unified dispatcher — mxfp8 chain.
+    unified_mxfp8_passed = True
+    for mTok, K1, nHid, nOut in MXFP8_CASES:
+        torch.manual_seed(1)
+        eps   = 1e-5
+        A     = (torch.randn(mTok, K1)   * 0.1).to(torch.bfloat16).cuda()
+        B1    = (torch.randn(nHid, K1)   * 0.1).to(torch.bfloat16).cuda()
+        gamma = (torch.rand(nHid)  + 0.5).to(torch.bfloat16).cuda()
+        W2    = (torch.randn(nOut, nHid) * 0.1).to(torch.bfloat16).cuda()
+        B2_fp8, scaleB2 = quantize_mxfp8_weight_nhid(W2)
+        try:
+            ref_out, _ = aiter.gemm_rmsnorm_gemm_mxfp8(A, B1, gamma, B2_fp8, scaleB2, eps)
+            res = aiter.gemm_rmsnorm_gemm(A, B1, gamma, B2_fp8, scaleB2=scaleB2, eps=eps)
+            assert torch.equal(res.out, ref_out), "unified mxfp8 output mismatch"
+        except AssertionError as exc:
+            print(f"  UNIFIED MXFP8 FAIL ({mTok},{K1},{nHid},{nOut}): {exc}")
+            unified_mxfp8_passed = False
+    if unified_mxfp8_passed:
+        print("UNIFIED MXFP8 PASS")
+    else:
+        print("UNIFIED MXFP8 FAIL")
+
+    # Unified dispatcher — fp8-in chain.
+    unified_fp8in_passed = True
+    for mTok, K1, nHid, nOut in MXFP8_CASES:
+        torch.manual_seed(2)
+        eps   = 1e-5
+        a     = (torch.randn(mTok, K1)   * 0.1).to(torch.bfloat16).cuda()
+        b1    = (torch.randn(nHid, K1)   * 0.1).to(torch.bfloat16).cuda()
+        gamma = (torch.rand(nHid)  + 0.5).to(torch.bfloat16).cuda()
+        w2    = (torch.randn(nOut, nHid) * 0.1).to(torch.bfloat16).cuda()
+        a_fp8,  scaleA  = quantize_mxfp8_gfx950(a)
+        b1_fp8, scaleB1 = quantize_mxfp8_gfx950(b1)
+        b2_fp8, scaleB2 = quantize_mxfp8_weight_nhid(w2)
+        try:
+            ref_out, _ = aiter.gemm_rmsnorm_gemm_mxfp8_fp8in(
+                a_fp8, scaleA, b1_fp8, scaleB1, gamma, b2_fp8, scaleB2, eps)
+            res = aiter.gemm_rmsnorm_gemm(
+                a_fp8, b1_fp8, gamma, b2_fp8,
+                scaleA=scaleA, scaleB1=scaleB1, scaleB2=scaleB2, eps=eps)
+            assert torch.equal(res.out, ref_out), "unified fp8-in output mismatch"
+        except AssertionError as exc:
+            print(f"  UNIFIED FP8IN FAIL ({mTok},{K1},{nHid},{nOut}): {exc}")
+            unified_fp8in_passed = False
+    if unified_fp8in_passed:
+        print("UNIFIED FP8IN PASS")
+    else:
+        print("UNIFIED FP8IN FAIL")
