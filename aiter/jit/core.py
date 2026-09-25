@@ -939,7 +939,7 @@ def build_module(
             flags_hip.append("-DASM_DEBUG")
 
         flags_cc += flags_extra_cc
-        flags_hip += flags_extra_hip
+        flags_hip += [f for f in flags_extra_hip if f]
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         flags_hip = sorted(set(flags_hip))  # remove same flags
@@ -984,7 +984,7 @@ def build_module(
         extra_include_paths = [p for p in extra_include_paths if os.path.isdir(str(p))]
 
         if not hipify:
-            _extra_inc = extra_include
+            _extra_inc = [p for p in extra_include if p]
             if _is_ckfree:
                 _extra_inc = [p for p in extra_include if os.path.isdir(str(p))]
             extra_include_paths += [
@@ -1757,6 +1757,9 @@ def compile_ops(
                             "aiter_tensor_t",
                             doc_str,
                         )
+                        # Pybind11 renders torch::Tensor as at::Tensor in
+                        # auto-generated signatures; replace with the Python name.
+                        doc_str = doc_str.replace("at::Tensor", "torch.Tensor")
                         try:
                             aiter_tensor_t = get_module(
                                 "module_aiter_core"
